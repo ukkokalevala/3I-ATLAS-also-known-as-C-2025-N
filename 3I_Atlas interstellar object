@@ -1,0 +1,245 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ==== OLED Setup ====
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ==== WiFi Setup ====
+const char* ssid     = "";
+const char* password = "";
+
+// ==== API URL ====
+String sbdbURL = "https://ssd-api.jpl.nasa.gov/sbdb.api?sstr=C%2F2025%20N1";
+
+// ==== Data holders ====
+String objName = "C/2025 N1 (ATLAS)";
+String epochDate = "—";
+String eccentricity = "—";
+String perihelion = "—";
+String inclination = "—";
+String perihelionTime = "—";
+String lastUpdateTime = "Never";
+
+// ==== Timing Control ====
+int page = 0;
+unsigned long lastSwitch = 0;
+const unsigned long pageDelay = 5000; // 5 seconds per page
+unsigned long lastDataRefresh = 0;
+const unsigned long refreshInterval = 900000; // 15 minutes (900000 ms)
+
+// ==== Julian to Calendar Date Conversion ====
+String julianToCalendar(double jd) {
+  jd += 0.5;
+  int z = floor(jd);
+  int w = floor((z - 1867216.25) / 36524.25);
+  int x = floor(w / 4);
+  int a = z + 1 + w - x;
+  int b = a + 1524;
+  int c = floor((b - 122.1) / 365.25);
+  int d = floor(365.25 * c);
+  int e = floor((b - d) / 30.6001);
+  int day = b - d - floor(30.6001 * e);
+  int month = (e < 14) ? e - 1 : e - 13;
+  int year = (month > 2) ? c - 4716 : c - 4715;
+  
+  char dateStr[11];
+  snprintf(dateStr, sizeof(dateStr), "%04d-%02d-%02d", year, month, day);
+  return String(dateStr);
+}
+
+// ==== Get current time string ====
+String getCurrentTime() {
+  unsigned long seconds = millis() / 1000;
+  unsigned long minutes = seconds / 60;
+  seconds %= 60;
+  minutes %= 60;
+  char timeStr[9];
+  snprintf(timeStr, sizeof(timeStr), "%02lu:%02lu:%02lu", minutes, seconds, millis() % 1000 / 10);
+  return String(timeStr);
+}
+
+// ==== Parse SBDB ====
+void parseSBDB(String payload) {
+  DynamicJsonDocument doc(16384);
+  if (deserializeJson(doc, payload)) {
+    Serial.println("SBDB JSON error");
+    return;
+  }
+
+  // Get object name
+  if (doc["object"]["fullname"]) {
+    objName = String((const char*)doc["object"]["fullname"]);
+  }
+
+  // Epoch
+  if (doc["orbit"]["epoch"]) {
+    double jd = atof((const char*)doc["orbit"]["epoch"]);
+    epochDate = julianToCalendar(jd);
+  }
+
+  // Orbital elements
+  JsonArray elements = doc["orbit"]["elements"].as<JsonArray>();
+  for (JsonObject elem : elements) {
+    String n = elem["name"];
+    if (n == "e") eccentricity = String((const char*)elem["value"]);
+    if (n == "q") perihelion = String((const char*)elem["value"]) + " AU";
+    if (n == "i") inclination = String((const char*)elem["value"]) + "°";
+    if (n == "tp") {
+      double tp_jd = atof((const char*)elem["value"]);
+      perihelionTime = julianToCalendar(tp_jd);
+    }
+  }
+
+  lastUpdateTime = getCurrentTime();
+  Serial.println("SBDB data updated at: " + lastUpdateTime);
+}
+
+// ==== Fetch API ====
+void fetchAPI() {
+  HTTPClient http;
+  http.begin(sbdbURL);
+  int code = http.GET();
+  if (code == 200) {
+    parseSBDB(http.getString());
+    Serial.println("Data refresh successful");
+  } else {
+    Serial.println("SBDB HTTP error: " + String(code));
+  }
+  http.end();
+}
+
+// ==== Draw OLED pages ====
+void drawPage() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  if (page == 0) {
+    // Page 0: Basic info
+    display.setCursor(0, 0); 
+    display.println(objName);
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+    
+    display.setCursor(0, 16); 
+    display.println("Orbit Epoch:");
+    display.setCursor(0, 26); 
+    display.println(epochDate);
+    
+    display.setCursor(0, 42);
+    display.println("Hyperbolic comet");
+    display.setCursor(0, 52);
+    display.println("Retrograde orbit");
+  } 
+  else if (page == 1) {
+    // Page 1: Orbital elements
+    display.setCursor(0, 0); 
+    display.println("Orbital Elements");
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+    
+    display.setCursor(0, 16); 
+    display.print("Ecc: "); 
+    display.println(eccentricity);
+    
+    display.setCursor(0, 26); 
+    display.print("Peri: "); 
+    display.println(perihelion);
+    
+    display.setCursor(0, 36);
+    display.print("Incl: ");
+    display.println(inclination);
+    
+    display.setCursor(0, 46);
+    display.print("Tp: ");
+    display.println(perihelionTime);
+  }
+  else if (page == 2) {
+    // Page 2: Status information
+    display.setCursor(0, 0); 
+    display.println("System Status");
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+    
+    display.setCursor(0, 16);
+    display.print("Last update: ");
+    display.println(lastUpdateTime);
+    
+    display.setCursor(0, 26);
+    display.println("Auto-refresh: 15m");
+    
+    display.setCursor(0, 36);
+    display.println("Next update in:");
+    
+    // Countdown to next refresh
+    unsigned long secsLeft = (refreshInterval - (millis() - lastDataRefresh)) / 1000;
+    display.setCursor(0, 46);
+    display.print(String(secsLeft / 60) + "m " + String(secsLeft % 60) + "s");
+    
+    display.setCursor(0, 56);
+    display.println("WiFi: Connected");
+  }
+
+  // Page indicator
+  display.setCursor(100, 0);
+  display.print(page + 1);
+  display.print("/3");
+  
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(7, 6);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED allocation failed");
+    for(;;);
+  }
+  display.clearDisplay(); 
+  display.display();
+
+  // Show startup message
+  display.println("Connecting WiFi...");
+  display.display();
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  // Initial data fetch
+  fetchAPI();
+  lastDataRefresh = millis();
+  drawPage();
+  lastSwitch = millis();
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Page rotation
+  if (currentTime - lastSwitch > pageDelay) {
+    page = (page + 1) % 3;
+    drawPage();
+    lastSwitch = currentTime;
+  }
+  
+  // Auto-refresh data
+  if (currentTime - lastDataRefresh > refreshInterval) {
+    fetchAPI();
+    lastDataRefresh = currentTime;
+    drawPage(); // Redraw with new data
+  }
+  
+  // Update countdown on status page
+  if (page == 2 && currentTime % 1000 < 100) {
+    drawPage(); // Update countdown timer
+  }
+  
+  delay(100);
+}
